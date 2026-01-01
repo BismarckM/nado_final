@@ -29,6 +29,7 @@ export const config = {
     MAX_OPEN_ORDERS: 50,
     REPRICE_THRESHOLD: 30, // $30 Difference tolerance (Deadband)
     MIN_PROFIT_SPREAD: 0.0003, // 3bps = 왕복 수수료(2bps) + 마진(1bps)
+    INITIAL_ENTRY_PRICE_OVERRIDE: 87970, // API 미제공 시 수동 보정용
 
     // Jitter Loop Settings (Anti-Sybil)
     JITTER_MIN_MS: 1500,     // 1.5s

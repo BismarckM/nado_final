@@ -369,10 +369,152 @@ export class NadoExchange extends BaseExchange {
     }
 
     public async getPosition(symbol: string): Promise<Position | null> {
-        // Not easily available in SDK without another request.
-        // Returning null so StrategyEngine uses local tracking.
-        return null;
+        return this.safeExecute("GetPosition", async () => {
+            if (!this.client) return null;
+
+            const targetId = this.productMap.get(symbol) || 2;
+
+            const summary = await this.client.subaccount.getSubaccountSummary({
+                subaccountOwner: this.account.address,
+                subaccountName: 'default'
+            });
+
+            const summaryAny = summary as any;
+
+            // 중요: balances에 포지션(Perp)와 현물(Spot)이 섞여 있을 수 있음.
+            // 이전 로그 분석 결과 BTC 포지션(ID 2)이 balances 안에 존재했음.
+            const positions = summaryAny?.perpPositions || summaryAny?.positions || summaryAny?.balances || [];
+
+            if (positions.length > 0) {
+                // logger.info(`[Position Debug] Found ${positions.length} items in balances/positions`);
+                // positions.forEach((p: any) => logger.info(`[Pos Item] ID: ${p.productId}, Amt: ${p.amount}`)); 
+            }
+
+            for (const pos of positions) {
+                const posProductId = pos.productId || pos.product_id;
+
+                // === Product ID 매칭 (필수) ===
+                // balances에 USDC(ID 0) 등 다른 자산이 섞여 있으므로 ID 확인 필수
+                if (posProductId == targetId) {
+                    // amount: 양수 = Long, 음수 = Short
+                    const rawAmount = pos.amount || pos.size || "0";
+                    const amount = parseFloat(rawAmount) / 1e18;
+
+                    // === Indexer API를 통한 정확한 평단가 계산 ===
+                    let avgEntry = 0;
+                    if (amount !== 0) {
+                        try {
+                            avgEntry = await this.getAverageEntryPrice(amount, Number(targetId));
+                            logger.info(`[Position] Calculated Avg Entry from Indexer: $${avgEntry.toFixed(2)}`);
+                        } catch (e) {
+                            logger.warn(`[Position] Failed to calc entry from indexer, fallback: ${e}`);
+                            // Fallback
+                            const rawVQuote = pos.vQuoteBalance || pos.entryNotional || "0";
+                            const vQuote = Math.abs(parseFloat(rawVQuote) / 1e18);
+                            avgEntry = vQuote / Math.abs(amount);
+                        }
+                    }
+
+                    logger.info(`[Position] Found: ${amount.toFixed(5)} BTC @ $${avgEntry.toFixed(1)}`);
+
+                    return {
+                        symbol: symbol,
+                        size: amount,
+                        entryPrice: avgEntry,
+                        unrealizedPnl: 0,
+                        leverage: config.LEVERAGE || 5
+                    };
+                }
+            }
+
+            return null;
+        });
     }
 
+    /**
+     * Indexer API를 통해 최근 체결 내역을 조회하고 
+     * 현재 포지션 크기만큼의 가중 평균 진입가를 계산합니다.
+     */
+    private async getAverageEntryPrice(currentSize: number, productId: number): Promise<number> {
+        try {
+            const subaccount = subaccountToHex({
+                subaccountOwner: this.account.address,
+                subaccountName: 'default'
+            });
 
+            // Indexer V1 Root endpoint
+            const url = "https://archive.prod.nado.xyz/v1";
+            const payload = {
+                matches: {
+                    subaccounts: [subaccount],
+                    product_ids: [productId], // 해당 마켓 필터링
+                    limit: 50
+                }
+            };
+
+            const res = await fetch(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            });
+
+            if (res.status !== 200) {
+                const errText = await res.text();
+                throw new Error(`Indexer API Error ${res.status}: ${errText.slice(0, 100)}`);
+            }
+
+            const data = await res.json();
+            if (!data.matches || !Array.isArray(data.matches)) {
+                return 0;
+            }
+
+            let remainingSize = Math.abs(currentSize);
+            let totalValue = 0;
+            let totalSizeAccumulated = 0;
+
+            const isLong = currentSize > 0;
+
+            // Matches are ordered by submission_idx desc (latest first)
+            for (const m of data.matches) {
+                // 부동소수점 오차 고려
+                if (remainingSize <= 0.0000001) break;
+
+                const baseFilled = parseFloat(m.base_filled) / 1e18;
+                // base_filled positive = BUY (Long entry or Short close)
+                // base_filled negative = SELL (Short entry or Long close)
+                // Wait, per docs matches Example:
+                // Taker Order amount 2.0 (Buy), base_filled 0.736.
+                // So base_filled sign follows the side?
+                // Let's assume base_filled sign indicates net position change direction.
+                // Long Entry (+ size), Short Entry (- size).
+
+                const matchIsLong = baseFilled > 0;
+
+                // 포지션 방향과 같은 체결만 고려
+                if (matchIsLong === isLong) {
+                    const filledSize = Math.abs(baseFilled);
+                    const useSize = Math.min(filledSize, remainingSize);
+
+                    let price = 0;
+                    if (m.order && m.order.priceX18) {
+                        price = parseFloat(m.order.priceX18) / 1e18;
+                    } else {
+                        const quoteFilled = parseFloat(m.quote_filled) / 1e18;
+                        price = Math.abs(quoteFilled / baseFilled);
+                    }
+
+                    totalValue += price * useSize;
+                    totalSizeAccumulated += useSize;
+                    remainingSize -= useSize;
+                }
+            }
+
+            if (totalSizeAccumulated === 0) return 0;
+            return totalValue / totalSizeAccumulated;
+
+        } catch (e) {
+            logger.error(`[Indexer] Error calculating entry price: ${e}`);
+            throw e;
+        }
+    }
 }

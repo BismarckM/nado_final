@@ -47,6 +47,9 @@ export class StrategyEngine {
         // Always connect Hyena for Data (ATR), even if Hedging disabled
         await this.hyena.connect();
 
+        // === 기존 포지션 로드 ===
+        await this.loadExistingPosition();
+
         this.isRunning = true;
         this.setupEventListeners();
 
@@ -581,4 +584,29 @@ ${isHealthy ? "✅" : "⚠️"} Status: ${isHealthy ? "Healthy" : "WARNING"}
 
     // Deprecated but kept to satisfy interface if needed, or remove.
     // private async cancelMyOrders() ... REMOVED
+
+    private async loadExistingPosition() {
+        try {
+            const position = await this.nado.getPosition(config.TARGET_SYMBOL_NADO);
+
+            if (position && position.size !== 0) {
+                this.inventory = position.size;
+                this.avgEntryPrice = position.entryPrice;
+                this.totalEntryCost = Math.abs(this.inventory) * this.avgEntryPrice;
+
+                const side = position.size > 0 ? "LONG" : "SHORT";
+
+                // 청산 목표가 계산 (Long: +spread, Short: -spread)
+                const liqPrice = this.avgEntryPrice * (1 + (position.size > 0 ? 1 : -1) * config.MIN_PROFIT_SPREAD);
+
+                logger.info(`📦 [INIT] Loaded: ${side} ${Math.abs(position.size).toFixed(5)} BTC @ $${this.avgEntryPrice.toFixed(1)}`);
+
+                telegram.sendMessage(`📦 **기존 포지션 감지**\r\n방향: ${side}\r\n수량: ${Math.abs(position.size).toFixed(5)} BTC\r\n평균가: $${this.avgEntryPrice.toFixed(1)}\r\n청산가: $${liqPrice.toFixed(1)}`);
+            } else {
+                logger.info(`📦 [INIT] No existing position found. Starting fresh.`);
+            }
+        } catch (e) {
+            logger.error(`[INIT] Failed to load position: ${e}`);
+        }
+    }
 }
