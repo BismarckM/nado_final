@@ -18,6 +18,10 @@ export class StrategyEngine {
     private lastCandleUpdate: number = 0;
     private currentVolMult: number = 1.0;
 
+    // Position Tracking (for Profit Protection)
+    private avgEntryPrice: number = 0; // 평균 진입가
+    private totalEntryCost: number = 0; // 총 진입 비용 (for FIFO calculation)
+
     // Re-lock Loop
     private isProcessing: boolean = false;
     private lastTickTime: number = 0;
@@ -129,15 +133,82 @@ ${isHealthy ? "✅" : "⚠️"} Status: ${isHealthy ? "Healthy" : "WARNING"}
     private setupEventListeners() {
         this.nado.on('fill', async (fill) => {
             const size = typeof fill.size === 'string' ? parseFloat(fill.size) : fill.size;
-            const change = fill.side === 'buy' ? size : -size;
+            const isBuy = fill.side === 'buy';
+            const change = isBuy ? size : -size;
+            const prevInventory = this.inventory;
 
             this.inventory += change;
+
+            // === 평균 진입가 업데이트 ===
+            if (isBuy) {
+                // 롱 추가 또는 숏 청산
+                if (prevInventory >= 0) {
+                    // 기존 롱 또는 중립 -> 롱 추가
+                    this.totalEntryCost += size * fill.price;
+                    if (this.inventory > 0) {
+                        this.avgEntryPrice = this.totalEntryCost / this.inventory;
+                    }
+                } else {
+                    // 숏 청산 중
+                    if (this.inventory < 0) {
+                        // 부분 청산: totalEntryCost를 청산 비율만큼 줄임
+                        const closedRatio = size / Math.abs(prevInventory);
+                        this.totalEntryCost *= (1 - closedRatio);
+                        // avgEntryPrice는 유지됨
+                    } else if (this.inventory === 0) {
+                        // 숏 완전 청산
+                        this.totalEntryCost = 0;
+                        this.avgEntryPrice = 0;
+                    } else {
+                        // 숏 청산 후 롱 전환
+                        this.totalEntryCost = this.inventory * fill.price;
+                        this.avgEntryPrice = fill.price;
+                    }
+                }
+            } else {
+                // 숏 추가 또는 롱 청산
+                if (prevInventory <= 0) {
+                    // 기존 숏 또는 중립 -> 숏 추가
+                    this.totalEntryCost += size * fill.price;
+                    if (this.inventory < 0) {
+                        this.avgEntryPrice = this.totalEntryCost / Math.abs(this.inventory);
+                    }
+                } else {
+                    // 롱 청산 중
+                    if (this.inventory > 0) {
+                        // 부분 청산: totalEntryCost를 청산 비율만큼 줄임
+                        const closedRatio = size / prevInventory;
+                        this.totalEntryCost *= (1 - closedRatio);
+                        // avgEntryPrice는 유지됨
+                    } else if (this.inventory === 0) {
+                        // 롱 완전 청산
+                        this.totalEntryCost = 0;
+                        this.avgEntryPrice = 0;
+                    } else {
+                        // 롱 청산 후 숏 전환
+                        this.totalEntryCost = Math.abs(this.inventory) * fill.price;
+                        this.avgEntryPrice = fill.price;
+                    }
+                }
+            }
+
+            // === 체결된 오더를 activeOrdersMap에서 제거 ===
+            const orderId = fill.orderId;
+            if (orderId) {
+                for (const [key, orderInfo] of this.activeOrdersMap.entries()) {
+                    if (orderInfo.id === orderId) {
+                        this.activeOrdersMap.delete(key);
+                        logger.info(`🗑️ [FILL] Removed ${key} from activeOrdersMap`);
+                        break;
+                    }
+                }
+            }
 
             // Track Volume
             const tradeValueUSD = size * fill.price;
             this.totalVolumeUSD += tradeValueUSD;
 
-            logger.info(`🔔 [FILL] ${fill.side.toUpperCase()} ${size} @ ${fill.price}. Inv: ${this.inventory.toFixed(4)} | Vol: $${this.totalVolumeUSD.toFixed(2)}`);
+            logger.info(`🔔 [FILL] ${fill.side.toUpperCase()} ${size.toFixed(5)} @ $${fill.price.toFixed(1)}. Inv: ${this.inventory.toFixed(4)} | AvgEntry: $${this.avgEntryPrice.toFixed(1)} | Vol: $${this.totalVolumeUSD.toFixed(2)}`);
 
             // Send Telegram Notification
             telegram.sendTradeNotification(fill.side, size, fill.price, this.inventory);
@@ -147,14 +218,13 @@ ${isHealthy ? "✅" : "⚠️"} Status: ${isHealthy ? "Healthy" : "WARNING"}
                 const posValue = Math.abs(this.inventory * fill.price);
                 if (posValue > config.HEDGE_THRESHOLD_USD) {
                     logger.warn(`⚠️ Hedge Triggered! PosVal: $${posValue.toFixed(0)}`);
-                    // Execute Hedge Logic Here (Basic Taker)
                     const hedgeSide = fill.side === 'buy' ? OrderSide.SELL : OrderSide.BUY;
                     await this.hyena.placeOrder({
                         symbol: config.TARGET_SYMBOL_HYENA,
                         side: hedgeSide,
                         type: OrderType.MARKET,
                         size: size,
-                        price: hedgeSide === OrderSide.BUY ? fill.price * 1.05 : fill.price * 0.95 // 5% slip
+                        price: hedgeSide === OrderSide.BUY ? fill.price * 1.05 : fill.price * 0.95
                     });
                 }
             }
@@ -356,11 +426,22 @@ ${isHealthy ? "✅" : "⚠️"} Status: ${isHealthy ? "Healthy" : "WARNING"}
             longSpreads.forEach((spread, i) => {
                 if (i >= ratios.length) return;
                 const ratio = ratios[i];
-                const price = Math.floor(mid * (1 - spread) * 10) / 10;
+                let price = Math.floor(mid * (1 - spread) * 10) / 10;
                 const usdSize = config.ORDER_SIZE_USD * ratio;
                 const rawSize = usdSize / price;
                 const stepSize = 0.00005;
                 const size = parseFloat((Math.ceil(rawSize / stepSize) * stepSize).toFixed(5));
+
+                // === 수익 보호 로직 ===
+                // Short 포지션 보유 시: Long 가격은 평균 진입가 - 최소 스프레드 이하여야 함
+                if (this.inventory < 0 && this.avgEntryPrice > 0) {
+                    const maxProfitPrice = this.avgEntryPrice * (1 - config.MIN_PROFIT_SPREAD);
+                    if (price > maxProfitPrice) {
+                        // 가격을 낮춰서 수익 보장
+                        price = Math.floor(maxProfitPrice * 10) / 10;
+                        logger.info(`[PROFIT] Long ${i} price lowered to $${price.toFixed(1)} (AvgEntry: $${this.avgEntryPrice.toFixed(1)})`);
+                    }
+                }
 
                 if (size > 0 && usdSize >= 100) {
                     targetOrders.push({
@@ -382,11 +463,22 @@ ${isHealthy ? "✅" : "⚠️"} Status: ${isHealthy ? "Healthy" : "WARNING"}
             shortSpreads.forEach((spread, i) => {
                 if (i >= ratios.length) return;
                 const ratio = ratios[i];
-                const price = Math.ceil(mid * (1 + spread) * 10) / 10;
+                let price = Math.ceil(mid * (1 + spread) * 10) / 10;
                 const usdSize = config.ORDER_SIZE_USD * ratio;
                 const rawSize = usdSize / price;
                 const stepSize = 0.00005;
                 const size = parseFloat((Math.ceil(rawSize / stepSize) * stepSize).toFixed(5));
+
+                // === 수익 보호 로직 ===
+                // Long 포지션 보유 시: Short 가격은 평균 진입가 + 최소 스프레드 이상이어야 함
+                if (this.inventory > 0 && this.avgEntryPrice > 0) {
+                    const minProfitPrice = this.avgEntryPrice * (1 + config.MIN_PROFIT_SPREAD);
+                    if (price < minProfitPrice) {
+                        // 가격을 올려서 수익 보장
+                        price = Math.ceil(minProfitPrice * 10) / 10;
+                        logger.info(`[PROFIT] Short ${i} price raised to $${price.toFixed(1)} (AvgEntry: $${this.avgEntryPrice.toFixed(1)})`);
+                    }
+                }
 
                 if (size > 0 && usdSize >= 100) {
                     targetOrders.push({
