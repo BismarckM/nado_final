@@ -444,11 +444,12 @@ export class NadoExchange extends BaseExchange {
 
             // Indexer V1 Root endpoint
             const url = "https://archive.prod.nado.xyz/v1";
+            // limit를 넉넉히 잡아서 포지션 시작점(0)을 찾을 확률 높임
             const payload = {
                 matches: {
                     subaccounts: [subaccount],
-                    product_ids: [productId], // 해당 마켓 필터링
-                    limit: 50
+                    product_ids: [productId], // 해당 마켓 필터링 (필수)
+                    limit: 100
                 }
             };
 
@@ -468,45 +469,118 @@ export class NadoExchange extends BaseExchange {
                 return 0;
             }
 
-            let remainingSize = Math.abs(currentSize);
             let totalValue = 0;
             let totalSizeAccumulated = 0;
 
             const isLong = currentSize > 0;
 
-            // Matches are ordered by submission_idx desc (latest first)
+            // [핵심 수정]
+            // 거래소 평단가는 부분 익절(Close)을 해도 변하지 않음.
+            // 따라서 "현재 잔량"만 역추적하는 게 아니라,
+            // "포지션이 시작된 지점(Genesis)"까지의 "모든 진입(Open) 주문"을 합산해야 함.
+
+            const entryMatches: { size: number, price: number }[] = [];
+
             for (const m of data.matches) {
-                // 부동소수점 오차 고려
-                if (remainingSize <= 0.0000001) break;
+                // 1. Post Balance 파싱
+                let postBalance = 0;
+                let foundBalance = false;
+                try {
+                    const perp = m.post_balance?.base?.perp;
+                    if (perp) {
+                        if (Array.isArray(perp)) {
+                            const p = perp.find((x: any) => x.product_id == productId);
+                            if (p?.balance?.amount) {
+                                postBalance = parseFloat(p.balance.amount) / 1e18;
+                                foundBalance = true;
+                            }
+                        } else if (perp.product_id == productId && perp.balance?.amount) {
+                            postBalance = parseFloat(perp.balance.amount) / 1e18;
+                            foundBalance = true;
+                        }
+                    }
+                } catch (e) { }
 
-                const baseFilled = parseFloat(m.base_filled) / 1e18;
-                // base_filled positive = BUY (Long entry or Short close)
-                // base_filled negative = SELL (Short entry or Long close)
-                // Wait, per docs matches Example:
-                // Taker Order amount 2.0 (Buy), base_filled 0.736.
-                // So base_filled sign follows the side?
-                // Let's assume base_filled sign indicates net position change direction.
-                // Long Entry (+ size), Short Entry (- size).
+                if (!foundBalance) continue; // 잔고 정보 없으면 스킵 (계산 불가)
 
-                const matchIsLong = baseFilled > 0;
+                const baseFilled = parseFloat(m.base_filled) / 1e18; // Net Flow (Buy: +, Sell: -)
+                const preBalance = postBalance - baseFilled; // 역산: 체결 전 잔고
 
-                // 포지션 방향과 같은 체결만 고려
-                if (matchIsLong === isLong) {
-                    const filledSize = Math.abs(baseFilled);
-                    const useSize = Math.min(filledSize, remainingSize);
+                const isCurrentLong = currentSize > 0;
+                const isPreLong = preBalance > 0.0000001;
+                const isPreZero = Math.abs(preBalance) <= 0.0000001;
+                const isPreSameSide = (isCurrentLong === isPreLong) && !isPreZero;
 
+                // [Step Analysis]
+                // Case 1: Pre가 같은 방향 (ex: Short -> 더 깊은 Short)
+                // -> 순수 진입(Add). 이 Match 전체가 평단에 기여. 계속 과거 탐색.
+
+                // Case 2: Pre가 0 (ex: 0 -> Short)
+                // -> 순수 진입(Open). 이 Match 전체가 평단에 기여.
+                // -> 단, 여기가 시작점이므로 루프 종료.
+
+                // Case 3: Pre가 다른 방향 (ex: Long -> Short) (Reversal)
+                // -> "청산 + 진입" 복합 주문.
+                // -> 이 Match의 크기(baseFilled) 중, '청산'에 쓰인 건 날리고, 
+                //    '진입'에 쓰인 부분(= postBalance)만 평단에 기여해야 함.
+                // -> 여기가 시작점이므로 루프 종료.
+
+                // Case 4: Pre가 다른 방향인데 Post도 다른 방향? (ex: Long -> 덜 Long)
+                // -> 이건 진입이 아니라 "청산(Reduce)" 주문임. 평단 영향 X.
+                // -> 우리 포지션 방향(isLong)과 baseFilled 방향 비교로 이미 필터링됨?
+                //    Short 포지션이면 baseFilled는 음수(매도). 
+                //    Long -> 덜 Long은 매도(음수). 방향 같음.
+                //    하지만 결과가 여전히 Long이므로, 우리(Short) 입장에선 진입 내역이 아님.
+                //    postBalance가 우리 방향과 다르면 skip 해야 함.
+
+                const isPostSameSide = (postBalance > 0) === isCurrentLong;
+                if (Math.abs(postBalance) > 0.0000001 && !isPostSameSide) {
+                    // 현재 Short인데 과거 잔고가 Long이었다?
+                    // 이는 우리가 찾는 '현재 포지션의 진입 내역'이 아님 (이미 청산된 과거 사이클).
+                    // 찾던 사이클이 끝났으므로 종료.
+                    break;
+                }
+
+                // 체크: 이 주문이 우리 포지션 방향으로의 '진입' 혹은 '전환' 액션인가?
+                // Short 포지션이면 -> 매도(baseFilled < 0)여야 함.
+                const isActionSameSide = (baseFilled > 0) === isCurrentLong;
+                if (!isActionSameSide) {
+                    // 반대 방향 주문(익절/손절)은 평단 영향 없음. Skip.
+                    continue;
+                }
+
+                // === 합산 로직 ===
+                let useSize = Math.abs(baseFilled);
+                let shouldBreak = false;
+
+                if (!isPreSameSide) {
+                    // Reversal(Long->Short) 또는 Open(0->Short)
+                    // 이 경우 실제 진입된 물량은 Match Size 전체가 아니라, 잔고에 남은 양(postBalance) 만큼임.
+                    // (Open인 경우 postBalance == baseFilled 이므로 동일)
+                    useSize = Math.abs(postBalance);
+                    shouldBreak = true; // 시작점이므로 종료
+                }
+
+                if (useSize > 0.0000001) {
                     let price = 0;
-                    if (m.order && m.order.priceX18) {
+                    if (m.order && m.order.priceX18 && BigInt(m.order.priceX18) > 0n) {
                         price = parseFloat(m.order.priceX18) / 1e18;
                     } else {
                         const quoteFilled = parseFloat(m.quote_filled) / 1e18;
-                        price = Math.abs(quoteFilled / baseFilled);
+                        if (baseFilled !== 0 && quoteFilled !== 0) {
+                            price = Math.abs(quoteFilled / baseFilled); // 전체 평단
+                        }
                     }
-
-                    totalValue += price * useSize;
-                    totalSizeAccumulated += useSize;
-                    remainingSize -= useSize;
+                    entryMatches.push({ size: useSize, price: price });
                 }
+
+                if (shouldBreak) break;
+            }
+
+            // 수집된 모든 진입 주문의 가중 평균 계산
+            for (const entry of entryMatches) {
+                totalValue += entry.price * entry.size;
+                totalSizeAccumulated += entry.size;
             }
 
             if (totalSizeAccumulated === 0) return 0;
