@@ -425,78 +425,92 @@ ${isHealthy ? "✅" : "⚠️"} Status: ${isHealthy ? "Healthy" : "WARNING"}
         const targetOrders: { key: string, order: Order }[] = [];
 
         // Buys
-        if (posValue < config.MAX_POSITION_USD) {
-            longSpreads.forEach((spread, i) => {
-                if (i >= ratios.length) return;
-                const ratio = ratios[i];
-                let price = Math.floor(mid * (1 - spread) * 10) / 10;
-                const usdSize = config.ORDER_SIZE_USD * ratio;
-                const rawSize = usdSize / price;
-                const stepSize = 0.00005;
-                const size = parseFloat((Math.ceil(rawSize / stepSize) * stepSize).toFixed(5));
+        // Buys
+        longSpreads.forEach((spread, i) => {
+            if (i >= ratios.length) return;
 
-                // === 수익 보호 로직 ===
-                // Short 포지션 보유 시: Long 가격은 평균 진입가 - 최소 스프레드 이하여야 함
-                if (this.inventory < 0 && this.avgEntryPrice > 0) {
-                    const maxProfitPrice = this.avgEntryPrice * (1 - config.MIN_PROFIT_SPREAD);
-                    if (price > maxProfitPrice) {
-                        // 가격을 낮춰서 수익 보장
-                        price = Math.floor(maxProfitPrice * 10) / 10;
-                        logger.info(`[PROFIT] Long ${i} price lowered to $${price.toFixed(1)} (AvgEntry: $${this.avgEntryPrice.toFixed(1)})`);
+            // === Risk Management Override (Soft Limit) ===
+            // If inventory exceeds MAX, only allow outer grids (indexes >= 2)
+            // Absolute Hard Cap at 1.5x MAX
+            if (posValue >= config.MAX_POSITION_USD) {
+                if (posValue >= config.MAX_POSITION_USD * 1.5) return; // Hard Stop
+                if (i < 2) return; // Skip aggressive orders
+            }
+            const ratio = ratios[i];
+            let price = Math.floor(mid * (1 - spread) * 10) / 10;
+            const usdSize = config.ORDER_SIZE_USD * ratio;
+            const rawSize = usdSize / price;
+            const stepSize = 0.00005;
+            const size = parseFloat((Math.ceil(rawSize / stepSize) * stepSize).toFixed(5));
+
+            // === 수익 보호 로직 (Original) ===
+            // 모든 그리드 주문은 최소 수익률을 보장하는 가격으로만 제출됨
+            if (this.inventory < 0 && this.avgEntryPrice > 0) {
+                const maxProfitPrice = this.avgEntryPrice * (1 - config.MIN_PROFIT_SPREAD);
+                if (price > maxProfitPrice) {
+                    // 가격을 낮춰서 수익 보장
+                    price = Math.floor(maxProfitPrice * 10) / 10;
+                    logger.info(`[PROFIT] Long ${i} price lowered to $${price.toFixed(1)} (AvgEntry: $${this.avgEntryPrice.toFixed(1)})`);
+                }
+            }
+
+            if (size > 0 && usdSize >= 100) {
+                targetOrders.push({
+                    key: `buy_${i}`,
+                    order: {
+                        symbol: config.TARGET_SYMBOL_NADO,
+                        side: OrderSide.BUY,
+                        type: OrderType.POST_ONLY,
+                        price: price,
+                        size: size
                     }
-                }
-
-                if (size > 0 && usdSize >= 100) {
-                    targetOrders.push({
-                        key: `buy_${i}`,
-                        order: {
-                            symbol: config.TARGET_SYMBOL_NADO,
-                            side: OrderSide.BUY,
-                            type: OrderType.POST_ONLY,
-                            price: price,
-                            size: size
-                        }
-                    });
-                }
-            });
-        }
+                });
+            }
+        });
 
         // Sells
-        if (posValue > -config.MAX_POSITION_USD) {
-            shortSpreads.forEach((spread, i) => {
-                if (i >= ratios.length) return;
-                const ratio = ratios[i];
-                let price = Math.ceil(mid * (1 + spread) * 10) / 10;
-                const usdSize = config.ORDER_SIZE_USD * ratio;
-                const rawSize = usdSize / price;
-                const stepSize = 0.00005;
-                const size = parseFloat((Math.ceil(rawSize / stepSize) * stepSize).toFixed(5));
+        // Sells
+        shortSpreads.forEach((spread, i) => {
+            if (i >= ratios.length) return;
 
-                // === 수익 보호 로직 ===
-                // Long 포지션 보유 시: Short 가격은 평균 진입가 + 최소 스프레드 이상이어야 함
-                if (this.inventory > 0 && this.avgEntryPrice > 0) {
-                    const minProfitPrice = this.avgEntryPrice * (1 + config.MIN_PROFIT_SPREAD);
-                    if (price < minProfitPrice) {
-                        // 가격을 올려서 수익 보장
-                        price = Math.ceil(minProfitPrice * 10) / 10;
-                        logger.info(`[PROFIT] Short ${i} price raised to $${price.toFixed(1)} (AvgEntry: $${this.avgEntryPrice.toFixed(1)})`);
+            // === Risk Management Override (Soft Limit) ===
+            // If inventory exceeds MAX, only allow outer grids (indexes >= 2)
+            // Absolute Hard Cap at 1.5x MAX
+            if (posValue <= -config.MAX_POSITION_USD) {
+                if (posValue <= -config.MAX_POSITION_USD * 1.5) return; // Hard Stop
+                if (i < 2) return; // Skip aggressive orders
+            }
+            const ratio = ratios[i];
+            let price = Math.ceil(mid * (1 + spread) * 10) / 10;
+            const usdSize = config.ORDER_SIZE_USD * ratio;
+            const rawSize = usdSize / price;
+            const stepSize = 0.00005;
+            const size = parseFloat((Math.ceil(rawSize / stepSize) * stepSize).toFixed(5));
+
+            // === 수익 보호 로직 (Original) ===
+            // 모든 그리드 주문은 최소 수익률을 보장하는 가격으로만 제출됨
+            if (this.inventory > 0 && this.avgEntryPrice > 0) {
+                const minProfitPrice = this.avgEntryPrice * (1 + config.MIN_PROFIT_SPREAD);
+                if (price < minProfitPrice) {
+                    // 가격을 올려서 수익 보장
+                    price = Math.ceil(minProfitPrice * 10) / 10;
+                    logger.info(`[PROFIT] Short ${i} price raised to $${price.toFixed(1)} (AvgEntry: $${this.avgEntryPrice.toFixed(1)})`);
+                }
+            }
+
+            if (size > 0 && usdSize >= 100) {
+                targetOrders.push({
+                    key: `sell_${i}`,
+                    order: {
+                        symbol: config.TARGET_SYMBOL_NADO,
+                        side: OrderSide.SELL,
+                        type: OrderType.POST_ONLY,
+                        price: price,
+                        size: size
                     }
-                }
-
-                if (size > 0 && usdSize >= 100) {
-                    targetOrders.push({
-                        key: `sell_${i}`,
-                        order: {
-                            symbol: config.TARGET_SYMBOL_NADO,
-                            side: OrderSide.SELL,
-                            type: OrderType.POST_ONLY,
-                            price: price,
-                            size: size
-                        }
-                    });
-                }
-            });
-        }
+                });
+            }
+        });
 
         logger.info(`[STRAT] Mid:${mid.toFixed(1)} Vol:${volMult.toFixed(2)}x Inv:${this.inventory.toFixed(4)} Targets:${targetOrders.length}`);
 
@@ -516,31 +530,21 @@ ${isHealthy ? "✅" : "⚠️"} Status: ${isHealthy ? "Healthy" : "WARNING"}
                 const priceDiff = Math.abs(active.price - target.price);
                 const sizeDiffRatio = Math.abs(active.size - target.size) / target.size;
 
-                // Threshold Check: Price Diff > REPRICE_THRESHOLD ($30)
-                // AND Asymmetric Logic:
-                // - Buy: Only move UP (Chase). If price drops (comes to us), HOLD unless gap is huge (>$200).
-                // - Sell: Only move DOWN (Chase). If price rises (comes to us), HOLD unless gap is huge (>$200).
-
                 let shouldReprice = false;
-                const priceDiffVal = target.price - active.price; // New - Old
 
-                if (Math.abs(priceDiff) < config.REPRICE_THRESHOLD && sizeDiffRatio < 0.05) {
-                    shouldReprice = false; // Inside Deadband
-                } else if (sizeDiffRatio > 0.05) {
-                    shouldReprice = true; // Size changed significantly
-                } else {
-                    // Price Logic
-                    const MAX_STALE_DIST = 200; // Force update if too far
-
-                    if (target.side === OrderSide.BUY) {
-                        if (priceDiffVal > 0) shouldReprice = true; // Price moved UP, Chase it
-                        else if (priceDiffVal < -MAX_STALE_DIST) shouldReprice = true; // Dropped too much (Risk)
-                        else shouldReprice = false; // Price Dropped (Good for fill), HOLD
-                    } else {
-                        if (priceDiffVal < 0) shouldReprice = true; // Price moved DOWN, Chase it
-                        else if (priceDiffVal > MAX_STALE_DIST) shouldReprice = true; // Rose too much (Risk)
-                        else shouldReprice = false; // Price Rose (Good for fill), HOLD
-                    }
+                // 1. Size Changed?
+                if (sizeDiffRatio > 0.05) {
+                    shouldReprice = true;
+                }
+                // 2. Price Moved beyond Threshold?
+                else if (Math.abs(priceDiff) >= config.REPRICE_THRESHOLD) {
+                    shouldReprice = true;
+                }
+                // 3. Stale Check (Safety for Phantom Orders)
+                // If order is older than 5min (300s), refresh it to ensure sync with Exchange
+                // Keep queue priority if possible, but 5min is safe upper bound for phantom detection.
+                else if (Date.now() - active.timestamp > 300000) {
+                    shouldReprice = true;
                 }
 
                 if (shouldReprice) {

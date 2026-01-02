@@ -161,12 +161,17 @@ export class NadoExchange extends BaseExchange {
                 const pingInterval = setInterval(() => {
                     if (this.ws?.readyState === WebSocket.OPEN) {
                         try {
+                            // Docs: "You must send ping frames (opcode 0x9)"
+                            // Using native ws.ping() is correct. 
+                            // Removing JSON ping to strictly follow docs and avoid server disconnects due to invalid json msgs.
                             this.ws.ping();
                         } catch (e) { }
-                    } else {
+                    } else if (this.ws?.readyState === WebSocket.CLOSED || this.ws?.readyState === WebSocket.CLOSING) {
                         clearInterval(pingInterval);
+                        logger.warn(`[${this.name}] WS Closed. Reconnecting...`);
+                        this.connect(); // Auto Reconnect
                     }
-                }, 30000);
+                }, 15000); // 15s Interval (Safe margin for 30s requirement)
 
                 this.ws.onopen = async () => {
                     logger.info(`[${this.name}] WS Open. Authenticating...`);
@@ -175,10 +180,10 @@ export class NadoExchange extends BaseExchange {
 
                         const targetId = this.productMap.get(config.TARGET_SYMBOL_NADO) || 2;
 
-                        // Subscribe Book
+                        // Subscribe BBO (Best Bid Offer) - More reliability, less drift than book_depth
                         this.ws?.send(JSON.stringify({
                             method: "subscribe",
-                            stream: { type: "book_depth", product_id: targetId },
+                            stream: { type: "best_bid_offer", product_id: targetId },
                             id: 100
                         }));
 
@@ -203,15 +208,37 @@ export class NadoExchange extends BaseExchange {
 
                 this.ws.onmessage = (event: any) => {
                     try {
+                        // Native Ping/Pong is handled by 'ws' lib automatically.
+                        // No need to handle JSON 'ping' logic unless explicitly required (docs say native only).
+
                         const msg = JSON.parse(event.data.toString());
-                        if (msg.type === "ping") {
-                            this.ws?.send(JSON.stringify({ type: "pong" }));
-                            return;
+                        const data = msg.data || msg;
+
+                        // Handle BBO (Best Bid Offer)
+                        // Expected format: { bid_price, bid_amount, ask_price, ask_amount, ... }
+                        if (data && (data.bid_price || data.ask_price)) {
+                            const bidPx = parseFloat(data.bid_price || "0") / 1e18;
+                            const bidSz = parseFloat(data.bid_amount || "0") / 1e18;
+                            const askPx = parseFloat(data.ask_price || "0") / 1e18;
+                            const askSz = parseFloat(data.ask_amount || "0") / 1e18;
+
+                            // Direct overwrite (Snapshot style) to prevent drift
+                            // Strategy reads this.exchange.getMidPrice() which uses this.latestBook
+
+                            const mid = (bidPx + askPx) / 2;
+                            this.latestBook = {
+                                symbol: config.TARGET_SYMBOL_NADO, // or keep existing symbol
+                                bid: bidPx,
+                                ask: askPx,
+                                spread: (askPx - bidPx) / mid,
+                                lastPrice: mid,
+                                inventory: this.latestBook.inventory // Preserve inventory
+                            };
                         }
 
-                        const data = msg.data || msg;
-                        if (data && (data.bids || data.asks)) {
-                            this.updateLocalBook(data.bids || [], data.asks || []);
+                        // Legacy Book Depth Handler (just in case, but usually not active with BBO sub)
+                        else if (data && (data.bids || data.asks)) {
+                            // this.updateLocalBook(data.bids || [], data.asks || []);
                         }
 
                         if (msg.type === "fill" || (msg.data && msg.data.type === "fill")) {
@@ -307,30 +334,51 @@ export class NadoExchange extends BaseExchange {
                 }]
             });
 
-            const digest = result?.data?.[0]?.digest || result?.orders?.[0]?.digest || `nado-${nonce}`;
+            // Extract Digest properly. Must be a valid hex string (0x...).
+            // Do NOT use fallback `nado-${nonce}` as it causes bytes32 errors in cancelOrder.
+            const digest = result?.data?.[0]?.digest || result?.orders?.[0]?.digest;
+
+            if (!digest) {
+                logger.error(`[Nado] PlaceOrder returned no digest! Result: ${JSON.stringify(result)}`);
+                throw new Error("PlaceOrder failed to return digest");
+            }
             return digest;
         });
     }
 
     public async cancelOrder(symbol: string, orderId: string): Promise<boolean> {
+        // Skip invalid orderIds (e.g. dummy IDs preventing bytes32 error)
+        if (!orderId || !orderId.startsWith('0x')) {
+            logger.warn(`[Nado] Skipping CancelOrder for invalid ID: ${orderId}`);
+            return true; // Treat as success (locally removed)
+        }
+
         return this.safeExecute("CancelOrder", async () => {
             if (!this.client) throw new Error("Client not initialized");
             const targetId = this.productMap.get(symbol) || 2;
             const marketApi = this.client.market as any;
 
+            // Try Structure A: { orders: [{ productId, digest }] } - Most likely correct for V1/V2
             try {
-                await marketApi.cancelOrders({
+                const cancelParams = {
                     subaccountName: 'default',
-                    productIds: [targetId],
-                    digests: [orderId]
-                });
-            } catch (e: any) {
-                // Legacy retry
-                await marketApi.cancelOrders({
-                    subaccountOwner: this.account.address,
-                    subaccountName: 'default',
-                    orders: [{ marketId: targetId, orderId: orderId, digest: orderId }]
-                });
+                    orders: [{ productId: targetId, digest: orderId }]
+                };
+                await marketApi.cancelOrders(cancelParams);
+                return true;
+            } catch (e1: any) {
+                // Try Structure B: { productIds: [], digests: [] } - Older V1
+                try {
+                    await marketApi.cancelOrders({
+                        subaccountName: 'default',
+                        productIds: [targetId],
+                        digests: [orderId]
+                    });
+                    return true;
+                } catch (e2: any) {
+                    logger.error(`[Nado] CancelOrder Failed (Both structures): ${e1.message} / ${e2.message}`);
+                    throw e1; // Rethrow original error to trigger zombie handling
+                }
             }
             return true;
         });
